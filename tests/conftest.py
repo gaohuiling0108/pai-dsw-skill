@@ -9,6 +9,25 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
+# ---------------------------------------------------------------------------
+# Mock SDK modules before any script imports (SDK may not be installed in CI)
+# ---------------------------------------------------------------------------
+_SDK_MODULES = [
+    'alibabacloud_pai_dsw20220101',
+    'alibabacloud_pai_dsw20220101.client',
+    'alibabacloud_pai_dsw20220101.models',
+    'alibabacloud_tea_openapi',
+    'alibabacloud_tea_openapi.models',
+    'alibabacloud_tea_util',
+    'alibabacloud_tea_util.models',
+    'alibabacloud_credentials',
+    'alibabacloud_credentials.client',
+]
+
+for _mod in _SDK_MODULES:
+    if _mod not in sys.modules:
+        sys.modules[_mod] = MagicMock()
+
 # Add scripts directory to path
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'scripts')
 sys.path.insert(0, os.path.abspath(SCRIPTS_DIR))

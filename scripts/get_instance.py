@@ -25,20 +25,24 @@ import argparse
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
-from dsw_utils import create_client
+from dsw_utils import create_client, filter_response, INSTANCE_DETAIL_FIELDS
 from alibabacloud_pai_dsw20220101 import models as dsw_models
 
 
-def get_instance(instance_id: str, region_id: str = None) -> dict:
+def get_instance(instance_id: str, region_id: str = None, detail_level: str = 'full') -> dict:
     """
     Get detailed information of a DSW instance.
     
     Args:
         instance_id: Instance ID
         region_id: Region ID
+        detail_level: Level of detail to return.
+            - 'brief': Only instance_id, instance_name, status
+            - 'summary': Core fields (spec, GPU, CPU, memory, creation_time)
+            - 'full': All fields (default)
     
     Returns:
-        Instance details dictionary
+        Instance details dictionary (None values stripped)
     """
     client = create_client(region_id)
     
@@ -47,7 +51,7 @@ def get_instance(instance_id: str, region_id: str = None) -> dict:
     
     if response.body:
         inst = response.body
-        return {
+        result = {
             'instance_id': inst.instance_id,
             'instance_name': inst.instance_name,
             'status': inst.status,
@@ -69,6 +73,8 @@ def get_instance(instance_id: str, region_id: str = None) -> dict:
             'spot_type': getattr(inst, 'spot_type', None),
             'idle_instance_culler': getattr(inst, 'idle_instance_culler', None),
         }
+        fields = INSTANCE_DETAIL_FIELDS.get(detail_level)
+        return filter_response(result, fields)
     
     return None
 
@@ -80,11 +86,13 @@ def main():
                         help='Region ID (default: from environment)')
     parser.add_argument('--format', choices=['table', 'json'], default='table',
                         help='Output format (default: table)')
+    parser.add_argument('--detail', choices=['brief', 'summary', 'full'], default='full',
+                        help='Detail level: brief/summary/full (default: full)')
     
     args = parser.parse_args()
     
     try:
-        result = get_instance(args.instance_id, args.region)
+        result = get_instance(args.instance_id, args.region, detail_level=args.detail)
         
         if result:
             if args.format == 'json':

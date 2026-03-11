@@ -28,11 +28,12 @@ import argparse
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
-from dsw_utils import create_client, get_workspace_id
+from dsw_utils import create_client, get_workspace_id, filter_response, INSTANCE_DETAIL_FIELDS
 from alibabacloud_pai_dsw20220101 import models as dsw_models
 
 
-def list_instances(client=None, region_id: str = None, workspace_id: str = None, format: str = 'json') -> list:
+def list_instances(client=None, region_id: str = None, workspace_id: str = None,
+                   format: str = 'json', detail_level: str = 'summary') -> list:
     """
     List all DSW instances.
     
@@ -41,6 +42,10 @@ def list_instances(client=None, region_id: str = None, workspace_id: str = None,
         region_id: Region ID
         workspace_id: Workspace ID
         format: Output format ('json' or 'table')
+        detail_level: Level of detail to return.
+            - 'brief': Only InstanceId, InstanceName, Status
+            - 'summary': Core fields (default)
+            - 'full': All fields
     
     Returns:
         List of instance dictionaries (or prints table if format='table')
@@ -68,11 +73,15 @@ def list_instances(client=None, region_id: str = None, workspace_id: str = None,
                 'Labels': getattr(inst, 'labels', {}),
             })
     
+    # Apply detail_level filtering
+    fields = INSTANCE_DETAIL_FIELDS.get(detail_level)
+    instances = filter_response(instances, fields)
+
     if format == 'table':
         print(f"\n{'Instance ID':<40} {'Name':<30} {'Status':<15} {'Type':<20}")
         print("-" * 105)
         for inst in instances:
-            print(f"{inst['InstanceId']:<40} {inst['InstanceName']:<30} {inst['Status']:<15} {inst['InstanceType'] or 'N/A':<20}")
+            print(f"{inst.get('InstanceId','N/A'):<40} {inst.get('InstanceName','N/A'):<30} {inst.get('Status','N/A'):<15} {inst.get('InstanceType','N/A') or 'N/A':<20}")
         return instances
     
     return instances
@@ -86,12 +95,15 @@ def main():
                         help='Workspace ID (default: from environment)')
     parser.add_argument('--format', choices=['json', 'table'], default='table',
                         help='Output format (default: table)')
+    parser.add_argument('--detail', choices=['brief', 'summary', 'full'], default='summary',
+                        help='Detail level: brief/summary/full (default: summary)')
     
     args = parser.parse_args()
     
     try:
         client = create_client(args.region)
-        instances = list_instances(client=client, workspace_id=args.workspace, format=args.format)
+        instances = list_instances(client=client, workspace_id=args.workspace,
+                                   format=args.format, detail_level=args.detail)
         
         if args.format == 'json':
             print(json.dumps(instances, indent=2, ensure_ascii=False))

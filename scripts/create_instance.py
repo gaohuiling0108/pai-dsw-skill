@@ -3,8 +3,8 @@
 Create a PAI-DSW instance with proper workspace and image configuration.
 
 This script handles:
-- Workspace ID detection from environment
-- Correct image URL formatting for ModelScope images
+- Workspace ID detection from environment/config
+- Image URI resolution via AIWorkSpace API
 - Proper API parameter mapping
 """
 
@@ -21,75 +21,77 @@ try:
     from alibabacloud_pai_dsw20220101.client import Client
     from alibabacloud_pai_dsw20220101 import models
     from alibabacloud_tea_openapi import models as open_api_models
-    from alibabacloud_credentials.client import Client as CredentialClient
     from alibabacloud_tea_util import models as util_models
 except ImportError as e:
     print(f"❌ Required packages not installed: {e}")
     print("Install with: pip install alibabacloud_pai_dsw20220101")
     sys.exit(1)
 
-def get_credentials() -> open_api_models.Config:
-    """Get credentials from environment or metadata service."""
-    # Try to get from environment first
-    access_key_id = os.getenv('ALIBABA_CLOUD_ACCESS_KEY_ID')
-    access_key_secret = os.getenv('ALIBABA_CLOUD_ACCESS_KEY_SECRET')
-    security_token = os.getenv('ALIBABA_CLOUD_SECURITY_TOKEN')
-    
-    if access_key_id and access_key_secret:
-        region = os.getenv('ALIBABA_CLOUD_REGION_ID', 'cn-beijing')
-        config = open_api_models.Config(
-            access_key_id=access_key_id,
-            access_key_secret=access_key_secret,
-            security_token=security_token,
-            endpoint=f'pai-dsw.{region}.aliyuncs.com'
-        )
-        return config
-    
-    # Try to get from credentials URI
-    credentials_uri = os.getenv('ALIBABA_CLOUD_CREDENTIALS_URI')
-    if credentials_uri:
-        try:
-            import requests
-            response = requests.get(credentials_uri, timeout=10)
-            if response.status_code == 200:
-                creds = response.json()
-                if creds.get('Code') == 'Success':
-                    region = os.getenv('ALIBABA_CLOUD_REGION_ID', 'cn-beijing')
-                    config = open_api_models.Config(
-                        access_key_id=creds['AccessKeyId'],
-                        access_key_secret=creds['AccessKeySecret'],
-                        security_token=creds['SecurityToken'],
-                        endpoint=f'pai-dsw.{region}.aliyuncs.com'
-                    )
-                    return config
-        except Exception as e:
-            print(f"⚠️ Failed to get credentials from URI: {e}")
-    
-    raise Exception("No valid credentials found")
+from dsw_utils import (
+    get_credentials as _get_creds,
+    get_region_id,
+    get_workspace_id as _get_workspace_id,
+)
 
-def get_workspace_id() -> str:
-    """Get current workspace ID from environment."""
-    workspace_id = os.getenv('PAI_WORKSPACE_ID')
-    if not workspace_id:
-        raise Exception("PAI_WORKSPACE_ID not found in environment")
-    return workspace_id
 
-def format_modelscope_image_url(image_name: str, region: str = 'cn-beijing') -> str:
+def resolve_image_uri(image_name: str, region_id: str = None) -> str:
     """
-    Format ModelScope image name to full registry URL.
+    Resolve an image name to its full image URI via AIWorkSpace API.
+    
+    Supports:
+    - Full URI (returned as-is): dsw-registry-vpc.xxx.cr.aliyuncs.com/pai/modelscope:xxx
+    - Short name: modelscope:1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04
     
     Args:
-        image_name: Image name like "modelscope:1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04"
-                    or just "1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04"
-        region: Alibaba Cloud region
+        image_name: Image name or full URI
+        region_id: Region ID for API call
     
     Returns:
-        Full image URL like "dsw-registry-vpc.cn-beijing.cr.aliyuncs.com/pai/modelscope:1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04"
+        Full image URI for DSW instance creation
     """
-    if image_name.startswith('dsw-registry-vpc'):
+    # Already a full URI
+    if image_name.startswith(('dsw-registry-vpc', 'registry-vpc')):
         return image_name
     
-    # Extract image name and tag
+    # Try to resolve via AIWorkSpace API
+    try:
+        from list_images import _create_workspace_client
+        from alibabacloud_aiworkspace20210204 import models as ws_models
+        
+        client = _create_workspace_client(region_id)
+        req = ws_models.ListImagesRequest(
+            labels='system.supported.dsw=true',
+            query=image_name,
+            verbose=False,
+            page_size=100,
+        )
+        resp = client.list_images(req)
+        
+        # Look for exact name match first
+        for img in (resp.body.images or []):
+            if img.name == image_name:
+                print(f"  ✅ 镜像已验证: {img.name}")
+                return img.image_uri
+        
+        # If no exact match, try prefix match (e.g. "modelscope:1.34.0" -> latest matching)
+        for img in (resp.body.images or []):
+            if img.name and img.name.startswith(image_name):
+                print(f"  ℹ️ 镜像模糊匹配: {image_name} -> {img.name}")
+                return img.image_uri
+        
+        print(f"  ⚠️ 未在 API 中找到镜像 '{image_name}'，将尝试直接构建 URI", file=sys.stderr)
+        
+    except ImportError:
+        print(f"  ⚠️ AIWorkSpace SDK 未安装，将直接构建镜像 URI", file=sys.stderr)
+    except Exception as e:
+        print(f"  ⚠️ 镜像查询失败 ({e})，将直接构建 URI", file=sys.stderr)
+    
+    # Fallback: construct URI manually
+    return _format_image_url(image_name, region_id or get_region_id())
+
+
+def _format_image_url(image_name: str, region: str) -> str:
+    """Fallback: construct image URL from name and region."""
     if ':' in image_name:
         parts = image_name.split(':', 1)
         name = parts[0]
@@ -98,21 +100,18 @@ def format_modelscope_image_url(image_name: str, region: str = 'cn-beijing') -> 
         name = 'modelscope'
         tag = image_name
     
-    # Default to modelscope if name is empty or just version
-    if not name or name == 'modelscope':
+    if not name:
         name = 'modelscope'
     
     registry = f'dsw-registry-vpc.{region}.cr.aliyuncs.com'
-    namespace = 'pai'
-    full_image = f'{registry}/{namespace}/{name}:{tag}'
-    return full_image
+    return f'{registry}/pai/{name}:{tag}'
 
 def create_dsw_instance(
     instance_name: str,
     image_id: str,
     instance_type: str = 'ecs.g6.large',
     workspace_id: Optional[str] = None,
-    region_id: str = 'cn-beijing',
+    region_id: str = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -120,39 +119,47 @@ def create_dsw_instance(
     
     Args:
         instance_name: Name of the instance
-        image_id: Image ID or name (will be formatted if it's a ModelScope image)
+        image_id: Image name or full URI (will be resolved via API)
         instance_type: Instance type (default: ecs.g6.large)
-        workspace_id: Workspace ID (defaults to current workspace from env)
-        region_id: Region ID (default: cn-beijing)
+        workspace_id: Workspace ID (defaults to current workspace from env/config)
+        region_id: Region ID (default: from env/config)
         **kwargs: Additional parameters for CreateInstanceRequest
         
     Returns:
         Dictionary with instance details
     """
-    # Get workspace ID
+    # Get region and workspace ID from config if not provided
+    if region_id is None:
+        region_id = get_region_id()
     if workspace_id is None:
-        workspace_id = get_workspace_id()
+        workspace_id = _get_workspace_id()
     
-    # Format image URL if needed
-    if image_id.startswith('modelscope:') or ':' in image_id:
-        image_id = format_modelscope_image_url(image_id, region_id)
+    # Resolve image URI via AIWorkSpace API
+    image_uri = resolve_image_uri(image_id, region_id)
     
     print(f"Creating DSW instance with parameters:")
     print(f"  Name: {instance_name}")
     print(f"  Workspace ID: {workspace_id}")
     print(f"  Region: {region_id}")
     print(f"  Instance Type: {instance_type}")
-    print(f"  Image: {image_id}")
+    print(f"  Image: {image_uri}")
     
     # Get credentials and create client
-    config = get_credentials()
-    config.region_id = region_id
+    creds = _get_creds()
+    endpoint = f'pai-dsw.{region_id}.aliyuncs.com'
+    config = open_api_models.Config(
+        access_key_id=creds['access_key_id'],
+        access_key_secret=creds['access_key_secret'],
+        security_token=creds.get('security_token'),
+        endpoint=endpoint,
+        region_id=region_id
+    )
     client = Client(config)
     
     # Create request
     request = models.CreateInstanceRequest(
         instance_name=instance_name,
-        image_url=image_id,  # Use image_url instead of image_id
+        image_url=image_uri,
         ecs_spec=instance_type,
         workspace_id=workspace_id,
         **kwargs
@@ -169,7 +176,7 @@ def create_dsw_instance(
                 'instance_name': instance_name,
                 'workspace_id': workspace_id,
                 'region_id': region_id,
-                'image_id': image_id,
+                'image_uri': image_uri,
                 'status': 'created'
             }
         else:
@@ -191,18 +198,16 @@ def main():
         epilog="""
 示例:
   # 创建 CPU 实例
-  python create_instance.py --name my-notebook --image modelscope:1.34.0 --type ecs.g6.large
+  python create_instance.py --name my-notebook --image modelscope:1.34.0-pytorch2.3.1-cpu-py311-ubuntu22.04 --type ecs.g6.large
   
-  # 创建 GPU 实例
-  python create_instance.py --name gpu-training --image pytorch:2.0.0 --type ecs.gn6v-c8g1.16xlarge
+  # 创建 GPU 实例（镜像名称会通过 API 自动解析为完整 URI）
+  python create_instance.py --name gpu-training --image modelscope:1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04 --type ecs.gn6i-c4g1.xlarge
   
-  # 带环境变量
-  python create_instance.py --name test --image modelscope:latest --type ecs.g6.large --env '{"API_KEY":"xxx"}'
+  # 使用完整镜像 URI
+  python create_instance.py --name test --image dsw-registry-vpc.cn-hangzhou.cr.aliyuncs.com/pai/modelscope:xxx --type ecs.g6.large
 
-镜像格式:
-  modelscope:1.34.0-pytorch2.9.1-cpu-py311-ubuntu22.04
-  pytorch:2.0.0-gpu-cu118
-  完整URL: dsw-registry-vpc.cn-hangzhou.cr.aliyuncs.com/pai/modelscope:xxx
+镜像名称:
+  可通过 list_images.py --search modelscope 查询可用镜像
 """
     )
     parser.add_argument('--name', required=True, help='Instance name')
@@ -258,7 +263,7 @@ def main():
         print(f"   Instance Name: {result['instance_name']}")
         print(f"   Workspace ID: {result['workspace_id']}")
         print(f"   Region: {result['region_id']}")
-        print(f"   Image: {result['image_id']}")
+        print(f"   Image: {result['image_uri']}")
         
     except Exception as e:
         print(f"\n❌ Failed to create DSW instance: {e}", file=sys.stderr)

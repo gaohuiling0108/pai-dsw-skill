@@ -18,10 +18,22 @@ import requests
 try:
     from alibabacloud_pai_dsw20220101.client import Client
     from alibabacloud_tea_openapi import models as open_api_models
+    _SDK_AVAILABLE = True
+    _SDK_IMPORT_ERROR = None
 except ImportError as e:
-    print(f"❌ Required packages not installed: {e}")
-    print("Install with: pip install alibabacloud-pai-dsw20220101")
-    sys.exit(1)
+    _SDK_AVAILABLE = False
+    _SDK_IMPORT_ERROR = e
+    Client = None
+    open_api_models = None
+
+
+def _ensure_sdk():
+    """Raise ImportError with install instructions if SDK is not available."""
+    if not _SDK_AVAILABLE:
+        raise ImportError(
+            f"Required packages not installed: {_SDK_IMPORT_ERROR}\n"
+            "Install with: pip install alibabacloud-pai-dsw20220101"
+        )
 
 # 导入环境检测模块
 try:
@@ -114,7 +126,7 @@ def get_credentials() -> dict:
         )
 
 
-def create_client(region_id: str = None, with_rate_limit: bool = True) -> Client:
+def create_client(region_id: str = None, with_rate_limit: bool = True):
     """
     Create PAI-DSW client with proper authentication.
     
@@ -127,6 +139,7 @@ def create_client(region_id: str = None, with_rate_limit: bool = True) -> Client
     Returns:
         PAI-DSW Client instance（如果启用限流，返回 RateLimitedClient 包装）
     """
+    _ensure_sdk()
     if region_id is None:
         region_id = get_region_id()
     
@@ -362,6 +375,43 @@ def print_table(headers: list, rows: list, title: str = None):
     # 打印数据行
     for row in rows:
         print('  '.join(str(cell).ljust(w) for cell, w in zip(row, col_widths)))
+
+
+def filter_response(data, fields=None):
+    """
+    Filter API response: keep only specified fields and remove None values.
+
+    This supports Progressive Disclosure for AI Agent integration.
+    Use with detail_level mappings to control response verbosity.
+
+    Args:
+        data: A dict, list of dicts, or other value.
+        fields: If provided, only keep keys in this set/list.
+                If None, keep all keys (but still strip None values).
+
+    Returns:
+        Filtered data with the same structure.
+    """
+    if isinstance(data, list):
+        return [filter_response(item, fields) for item in data]
+    if isinstance(data, dict):
+        result = {k: v for k, v in data.items() if v is not None}
+        if fields:
+            result = {k: v for k, v in result.items() if k in fields}
+        return result
+    return data
+
+
+# Detail level field definitions for common responses
+INSTANCE_DETAIL_FIELDS = {
+    'brief': ['instance_id', 'instance_name', 'status',
+              'InstanceId', 'InstanceName', 'Status'],
+    'summary': ['instance_id', 'instance_name', 'status', 'ecs_spec',
+                'gpu_count', 'gpu_type', 'cpu', 'memory', 'creation_time',
+                'InstanceId', 'InstanceName', 'Status', 'InstanceType',
+                'EcsSpec', 'CreationTime', 'Labels'],
+    'full': None,  # None means keep all fields
+}
 
 
 def get_current_instance_id() -> str:

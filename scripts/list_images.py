@@ -1,54 +1,126 @@
 #!/usr/bin/env python3
 """
 列出可用的 DSW 镜像
-由于 DSW SDK 不直接支持 ListImages，这里从实例中提取镜像信息
-并提供常用官方镜像列表
+
+通过 AIWorkSpace API (ListImages) 动态获取 DSW 可用的镜像列表，
+使用 system.supported.dsw=true 标签过滤。
 """
 
 import argparse
 import json
 import sys
 import os
-from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dsw_utils import create_client, get_workspace_id, print_table
+from dsw_utils import get_credentials, get_region_id, get_workspace_id, print_table
 
 try:
-    from alibabacloud_pai_dsw20220101 import models as dsw_models
+    from alibabacloud_aiworkspace20210204.client import Client as WorkspaceClient
+    from alibabacloud_aiworkspace20210204 import models as ws_models
+    from alibabacloud_tea_openapi import models as open_api_models
+    _WS_SDK_AVAILABLE = True
 except ImportError:
-    print("❌ 请安装: pip install alibabacloud-pai-dsw20220101")
-    sys.exit(1)
+    _WS_SDK_AVAILABLE = False
 
 
-# 常用官方镜像列表（参考阿里云 PAI-DSW 文档）
-OFFICIAL_IMAGES = [
-    # PyTorch 镜像
-    {'name': 'PyTorch 2.9.1 (GPU, CUDA 12.6)', 'image_id': 'pytorch:2.9.1-gpu-py311-cu126-ubuntu22.04', 'type': 'GPU'},
-    {'name': 'PyTorch 2.9.1 (CPU)', 'image_id': 'pytorch:2.9.1-cpu-py311-ubuntu22.04', 'type': 'CPU'},
-    {'name': 'PyTorch 2.7.1 (GPU, CUDA 12.4)', 'image_id': 'pytorch:2.7.1-gpu-py310-cu124-ubuntu22.04', 'type': 'GPU'},
-    {'name': 'PyTorch 2.7.1 (CPU)', 'image_id': 'pytorch:2.7.1-cpu-py310-ubuntu22.04', 'type': 'CPU'},
+def _create_workspace_client(region_id: str = None):
+    """创建 AIWorkSpace 客户端"""
+    if not _WS_SDK_AVAILABLE:
+        raise ImportError(
+            "需要安装 AIWorkSpace SDK:\n"
+            "  pip install alibabacloud-aiworkspace20210204"
+        )
     
-    # TensorFlow 镜像
-    {'name': 'TensorFlow 2.16 (GPU, CUDA 12.3)', 'image_id': 'tensorflow:2.16-gpu-py310-cu123-ubuntu22.04', 'type': 'GPU'},
-    {'name': 'TensorFlow 2.16 (CPU)', 'image_id': 'tensorflow:2.16-cpu-py310-ubuntu22.04', 'type': 'CPU'},
+    if region_id is None:
+        region_id = get_region_id()
     
-    # ModelScope 镜像
-    {'name': 'ModelScope 1.34.0 (GPU)', 'image_id': 'modelscope:1.34.0-pytorch2.9.1-gpu', 'type': 'GPU'},
-    {'name': 'ModelScope 1.34.0 (CPU)', 'image_id': 'modelscope:1.34.0-pytorch2.9.1-cpu', 'type': 'CPU'},
+    creds = get_credentials()
+    endpoint = f"aiworkspace.{region_id}.aliyuncs.com"
     
-    # PAI-Blade 镜像
-    {'name': 'PAI-Blade (GPU)', 'image_id': 'blade:latest-gpu', 'type': 'GPU'},
+    config = open_api_models.Config(
+        access_key_id=creds['access_key_id'],
+        access_key_secret=creds['access_key_secret'],
+        security_token=creds.get('security_token'),
+        endpoint=endpoint,
+        region_id=region_id
+    )
+    return WorkspaceClient(config)
+
+
+def _fetch_images_from_api(region_id: str = None, keyword: str = None,
+                           image_type: str = 'all', workspace_id: str = None):
+    """
+    通过 AIWorkSpace API 获取 DSW 可用镜像
     
-    # 基础镜像
-    {'name': 'Python 3.11 (Ubuntu 22.04)', 'image_id': 'python:3.11-ubuntu22.04', 'type': 'CPU'},
-    {'name': 'Python 3.10 (Ubuntu 22.04)', 'image_id': 'python:3.10-ubuntu22.04', 'type': 'CPU'},
+    Args:
+        region_id: 区域 ID
+        keyword: 搜索关键词（模糊匹配镜像名称和描述）
+        image_type: 镜像类型 (all, official, custom)
+        workspace_id: 工作空间 ID（获取自定义镜像时需要）
     
-    # 其他框架
-    {'name': 'DeepSpeed 0.15 (GPU)', 'image_id': 'deepspeed:0.15-gpu-py310-cu124', 'type': 'GPU'},
-    {'name': 'XGBoost 2.0 (CPU)', 'image_id': 'xgboost:2.0-cpu-py310', 'type': 'CPU'},
-]
+    Returns:
+        镜像列表
+    """
+    client = _create_workspace_client(region_id)
+    all_images = []
+    page_number = 1
+    page_size = 100
+    
+    # 构建标签过滤条件
+    labels = 'system.supported.dsw=true'
+    if image_type == 'official':
+        labels += ',system.official=true'
+    
+    while True:
+        req = ws_models.ListImagesRequest(
+            labels=labels,
+            verbose=True,
+            page_number=page_number,
+            page_size=page_size,
+        )
+        
+        # 使用 query 参数进行模糊搜索
+        if keyword:
+            req.query = keyword
+        
+        if workspace_id:
+            req.workspace_id = workspace_id
+        
+        resp = client.list_images(req)
+        images = resp.body.images or []
+        
+        for img in images:
+            labels_dict = {l.key: l.value for l in (img.labels or [])}
+            
+            # 判断镜像类型
+            is_official = labels_dict.get('system.official', '').lower() == 'true'
+            if image_type == 'official' and not is_official:
+                continue
+            if image_type == 'custom' and is_official:
+                continue
+            
+            chip_type = labels_dict.get('system.chipType', 'Unknown')
+            origin = labels_dict.get('system.origin', '')
+            
+            all_images.append({
+                'ImageId': img.name or '',
+                'ImageUri': img.image_uri or '',
+                'Name': img.name or '',
+                'Description': img.description or '',
+                'Type': 'OFFICIAL' if is_official else 'CUSTOM',
+                'Category': chip_type,
+                'Source': origin if origin else ('阿里云官方' if is_official else '自定义'),
+                'Labels': labels_dict,
+            })
+        
+        # 分页：如果当前页未满，说明没有更多数据
+        total = resp.body.total_count or 0
+        if page_number * page_size >= total:
+            break
+        page_number += 1
+    
+    return all_images
 
 
 def list_images(workspace_id: str = None, region_id: str = None, 
@@ -64,58 +136,12 @@ def list_images(workspace_id: str = None, region_id: str = None,
         keyword: 搜索关键词
     """
     try:
-        all_images = []
-        
-        # 获取官方镜像
-        if image_type in ['all', 'official']:
-            for img in OFFICIAL_IMAGES:
-                name = img['name']
-                if keyword and keyword.lower() not in name.lower() and keyword.lower() not in img['image_id'].lower():
-                    continue
-                all_images.append({
-                    'ImageId': img['image_id'],
-                    'Name': name,
-                    'Type': 'OFFICIAL',
-                    'Category': img['type'],
-                    'Source': '阿里云官方'
-                })
-        
-        # 从现有实例中提取自定义镜像
-        if image_type in ['all', 'custom']:
-            try:
-                client = create_client(region_id)
-                if not workspace_id:
-                    workspace_id = get_workspace_id()
-                
-                request = dsw_models.ListInstancesRequest(
-                    workspace_id=workspace_id,
-                    page_number=1,
-                    page_size=100
-                )
-                
-                response = client.list_instances(request)
-                
-                if response.status_code == 200 and response.body.instances:
-                    seen_images = set()
-                    for inst in response.body.instances:
-                        image_id = inst.image_id
-                        image_name = inst.image_name or image_id
-                        
-                        if image_id and image_id not in seen_images:
-                            seen_images.add(image_id)
-                            
-                            if keyword and keyword.lower() not in image_name.lower():
-                                continue
-                            
-                            all_images.append({
-                                'ImageId': image_id,
-                                'Name': image_name,
-                                'Type': 'CUSTOM',
-                                'Category': 'Unknown',
-                                'Source': '实例快照'
-                            })
-            except Exception as e:
-                print(f"⚠️ 无法获取自定义镜像: {e}", file=sys.stderr)
+        all_images = _fetch_images_from_api(
+            region_id=region_id,
+            keyword=keyword,
+            image_type=image_type,
+            workspace_id=workspace_id,
+        )
         
         if format == 'json':
             print(json.dumps(all_images, indent=2, ensure_ascii=False))
@@ -123,19 +149,23 @@ def list_images(workspace_id: str = None, region_id: str = None,
         
         if not all_images:
             print("⚠️ 未找到镜像")
+            if keyword:
+                print(f"   尝试换个关键词，或使用 --type all 查看全部镜像")
             return []
         
         print(f"\n📦 找到 {len(all_images)} 个镜像:\n")
         
-        headers = ['镜像ID', '名称', '类型', 'GPU/CPU', '来源']
+        headers = ['镜像名称', '类型', 'GPU/CPU', '来源']
         rows = []
         
         for img in all_images:
             type_str = "📘 官方" if img['Type'] == 'OFFICIAL' else "🔧 自定义"
+            name_display = img['Name']
+            if len(name_display) > 60:
+                name_display = name_display[:57] + '...'
             
             rows.append([
-                img['ImageId'][:40] + '...' if len(img['ImageId']) > 40 else img['ImageId'],
-                img['Name'][:35] + '...' if len(img['Name']) > 35 else img['Name'],
+                name_display,
                 type_str,
                 img['Category'],
                 img['Source']
@@ -144,14 +174,19 @@ def list_images(workspace_id: str = None, region_id: str = None,
         print_table(headers, rows)
         
         print(f"\n💡 提示:")
-        print(f"   - 创建实例时使用镜像ID，如: --image pytorch:2.9.1-gpu-py311-cu126-ubuntu22.04")
-        print(f"   - GPU镜像需要选择GPU规格 (如 ecs.gn7-c13g1.2xlarge)")
-        print(f"   - CPU镜像选择CPU规格 (如 ecs.g6.large)")
+        print(f"   - 创建实例时使用镜像名称，如: --image modelscope:1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04")
+        print(f"   - GPU 镜像需要选择 GPU 规格 (如 ecs.gn6i-c4g1.xlarge)")
+        print(f"   - CPU 镜像选择 CPU 规格 (如 ecs.g6.large)")
+        print(f"   - 使用 --format json 可查看完整镜像 URI")
         
         return all_images
         
+    except ImportError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        print("   pip install alibabacloud-aiworkspace20210204", file=sys.stderr)
+        return []
     except Exception as e:
-        print(f"❌ 错误: {e}")
+        print(f"❌ 获取镜像列表失败: {e}", file=sys.stderr)
         return []
 
 

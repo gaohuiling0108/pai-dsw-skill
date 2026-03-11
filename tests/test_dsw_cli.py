@@ -20,7 +20,7 @@ class TestResolveInstance:
     
     def test_exact_id(self, mock_env_credentials):
         """Test with exact instance ID."""
-        from dsw import resolve_instance
+        from dsw_commands.helpers import resolve_instance
         
         # Should pass through IDs that look like DSW IDs
         result = resolve_instance("dsw-123456-abcde")
@@ -28,15 +28,15 @@ class TestResolveInstance:
     
     def test_id_with_multiple_dashes(self, mock_env_credentials):
         """Test with ID format containing multiple dashes."""
-        from dsw import resolve_instance
+        from dsw_commands.helpers import resolve_instance
         
         result = resolve_instance("some-id-with-many-parts")
         assert result == "some-id-with-many-parts"
     
-    @patch('dsw.get_instances_json')
+    @patch('dsw_commands.helpers.get_instances_json')
     def test_exact_name_match(self, mock_get_instances, mock_env_credentials):
         """Test with exact name match."""
-        from dsw import resolve_instance
+        from dsw_commands.helpers import resolve_instance
         
         MOCK_INSTANCES_LIST = [
             {"InstanceId": "dsw-123456-abcde", "InstanceName": "test-instance", "Status": "Running"},
@@ -46,10 +46,10 @@ class TestResolveInstance:
         result = resolve_instance("test-instance")
         assert result == "dsw-123456-abcde"
     
-    @patch('dsw.get_instances_json')
+    @patch('dsw_commands.helpers.get_instances_json')
     def test_fuzzy_name_match(self, mock_get_instances, mock_env_credentials, capsys):
         """Test with fuzzy name match."""
-        from dsw import resolve_instance
+        from dsw_commands.helpers import resolve_instance
         
         MOCK_INSTANCES_LIST = [
             {"InstanceId": "dsw-123456-abcde", "InstanceName": "test-instance", "Status": "Running"},
@@ -62,27 +62,27 @@ class TestResolveInstance:
         captured = capsys.readouterr()
         assert "匹配到实例" in captured.out
     
-    @patch('dsw.get_instances_json')
-    def test_no_match(self, mock_get_instances, mock_env_credentials, capsys):
-        """Test with no matching instance."""
-        from dsw import resolve_instance
+    @patch('dsw_commands.helpers.get_instances_json')
+    def test_no_match(self, mock_get_instances, mock_env_credentials):
+        """Test with no matching instance raises InstanceNotFoundError."""
+        from dsw_commands.helpers import resolve_instance
+        from exceptions import InstanceNotFoundError
         
         MOCK_INSTANCES_LIST = [
             {"InstanceId": "dsw-123456-abcde", "InstanceName": "test-instance", "Status": "Running"},
         ]
         mock_get_instances.return_value = MOCK_INSTANCES_LIST
         
-        result = resolve_instance("nonexistent")
-        assert result is None
+        with pytest.raises(InstanceNotFoundError) as exc_info:
+            resolve_instance("nonexistent")
         
-        captured = capsys.readouterr()
-        # Error message is printed to stderr
-        assert "未找到" in captured.err
+        assert "未找到" in str(exc_info.value)
     
-    @patch('dsw.get_instances_json')
-    def test_multiple_matches(self, mock_get_instances, mock_env_credentials, capsys):
-        """Test with multiple matching instances."""
-        from dsw import resolve_instance
+    @patch('dsw_commands.helpers.get_instances_json')
+    def test_multiple_matches(self, mock_get_instances, mock_env_credentials):
+        """Test with multiple matching instances raises InstanceAmbiguousError."""
+        from dsw_commands.helpers import resolve_instance
+        from exceptions import InstanceAmbiguousError
         
         # Create instances with similar names
         mock_instances = [
@@ -91,11 +91,10 @@ class TestResolveInstance:
         ]
         mock_get_instances.return_value = mock_instances
         
-        result = resolve_instance("gpu")
-        assert result is None
+        with pytest.raises(InstanceAmbiguousError) as exc_info:
+            resolve_instance("gpu")
         
-        captured = capsys.readouterr()
-        assert "找到多个" in captured.err
+        assert "找到多个" in str(exc_info.value)
 
 
 class TestColorize:
@@ -139,11 +138,12 @@ class TestStatusBadge:
 class TestCmdList:
     """Tests for cmd_list function."""
     
-    @patch('dsw.run_script')
+    @patch('dsw_commands.instance.run_script')
     def test_list_default(self, mock_run_script, mock_env_credentials):
         """Test list command with defaults."""
         from dsw import cmd_list
         
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.format = 'table'
         mock_args.region = None
@@ -155,11 +155,12 @@ class TestCmdList:
         call_args = mock_run_script.call_args[0]
         assert call_args[0] == 'list_instances'
     
-    @patch('dsw.run_script')
+    @patch('dsw_commands.instance.run_script')
     def test_list_json_format(self, mock_run_script, mock_env_credentials):
         """Test list command with JSON format."""
         from dsw import cmd_list
         
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.format = 'json'
         mock_args.region = None
@@ -174,13 +175,14 @@ class TestCmdList:
 class TestCmdGet:
     """Tests for cmd_get function."""
     
-    @patch('dsw.run_script')
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.run_script')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_get_by_id(self, mock_resolve, mock_run_script, mock_env_credentials):
         """Test get command with instance ID."""
         from dsw import cmd_get
         
         mock_resolve.return_value = "dsw-123456-abcde"
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.instance = "dsw-123456-abcde"
         mock_args.format = 'table'
@@ -190,12 +192,13 @@ class TestCmdGet:
         mock_resolve.assert_called_once_with("dsw-123456-abcde")
         mock_run_script.assert_called_once()
     
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_get_invalid_instance(self, mock_resolve, mock_env_credentials):
         """Test get command with invalid instance."""
         from dsw import cmd_get
+        from exceptions import InstanceNotFoundError
         
-        mock_resolve.return_value = None
+        mock_resolve.side_effect = InstanceNotFoundError("nonexistent")
         mock_args = MagicMock()
         mock_args.instance = "nonexistent"
         mock_args.format = 'table'
@@ -207,13 +210,14 @@ class TestCmdGet:
 class TestCmdStart:
     """Tests for cmd_start function."""
     
-    @patch('dsw.run_script')
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.run_script')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_start_instance(self, mock_resolve, mock_run_script, mock_env_credentials):
         """Test start command."""
         from dsw import cmd_start
         
         mock_resolve.return_value = "dsw-123456-abcde"
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.instance = "test-instance"
         
@@ -227,13 +231,14 @@ class TestCmdStart:
 class TestCmdStop:
     """Tests for cmd_stop function."""
     
-    @patch('dsw.run_script')
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.run_script')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_stop_with_force(self, mock_resolve, mock_run_script, mock_env_credentials):
         """Test stop command with force flag."""
         from dsw import cmd_stop
         
         mock_resolve.return_value = "dsw-123456-abcde"
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.instance = "test-instance"
         mock_args.force = True
@@ -242,12 +247,13 @@ class TestCmdStop:
         
         mock_run_script.assert_called_once()
     
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_stop_invalid_instance(self, mock_resolve, mock_env_credentials):
         """Test stop command with invalid instance."""
         from dsw import cmd_stop
+        from exceptions import InstanceNotFoundError
         
-        mock_resolve.return_value = None
+        mock_resolve.side_effect = InstanceNotFoundError("nonexistent")
         mock_args = MagicMock()
         mock_args.instance = "nonexistent"
         mock_args.force = True
@@ -259,13 +265,14 @@ class TestCmdStop:
 class TestCmdDelete:
     """Tests for cmd_delete function."""
     
-    @patch('dsw.run_script')
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.run_script')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_delete_with_force(self, mock_resolve, mock_run_script, mock_env_credentials):
         """Test delete command with force flag."""
         from dsw import cmd_delete
         
         mock_resolve.return_value = "dsw-123456-abcde"
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.instance = "test-instance"
         mock_args.force = True
@@ -274,12 +281,13 @@ class TestCmdDelete:
         
         mock_run_script.assert_called_once()
     
-    @patch('dsw.resolve_instance')
+    @patch('dsw_commands.instance.resolve_instance')
     def test_delete_invalid_instance(self, mock_resolve, mock_env_credentials):
         """Test delete command with invalid instance."""
         from dsw import cmd_delete
+        from exceptions import InstanceNotFoundError
         
-        mock_resolve.return_value = None
+        mock_resolve.side_effect = InstanceNotFoundError("nonexistent")
         mock_args = MagicMock()
         mock_args.instance = "nonexistent"
         mock_args.force = True
@@ -291,11 +299,12 @@ class TestCmdDelete:
 class TestCmdCreate:
     """Tests for cmd_create function."""
     
-    @patch('dsw.run_script')
+    @patch('dsw_commands.instance.run_script')
     def test_create_instance(self, mock_run_script, mock_env_credentials):
         """Test create command."""
         from dsw import cmd_create
         
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         mock_args.name = "new-instance"
         mock_args.image = "modelscope:1.34.0"
@@ -312,7 +321,7 @@ class TestCmdCreate:
 class TestCmdSearch:
     """Tests for cmd_search function."""
     
-    @patch('dsw.get_instances_json')
+    @patch('dsw_commands.search.get_instances_json')
     def test_search_by_name(self, mock_get_instances, mock_env_credentials, capsys):
         """Test search by instance name."""
         from dsw import cmd_search
@@ -331,7 +340,7 @@ class TestCmdSearch:
         captured = capsys.readouterr()
         assert "test-instance" in captured.out
     
-    @patch('dsw.get_instances_json')
+    @patch('dsw_commands.search.get_instances_json')
     def test_search_no_results(self, mock_get_instances, mock_env_credentials, capsys):
         """Test search with no results."""
         from dsw import cmd_search
@@ -350,7 +359,7 @@ class TestCmdSearch:
         captured = capsys.readouterr()
         assert "未找到" in captured.out
     
-    @patch('dsw.get_instances_json')
+    @patch('dsw_commands.search.get_instances_json')
     def test_search_by_label(self, mock_get_instances, mock_env_credentials, capsys):
         """Test search by label."""
         from dsw import cmd_search
@@ -370,11 +379,12 @@ class TestCmdSearch:
 class TestCmdStatus:
     """Tests for cmd_status function."""
     
-    @patch('dsw.run_script')
+    @patch('dsw_commands.monitoring.run_script')
     def test_status_in_dsw(self, mock_run_script, mock_env_credentials, capsys):
         """Test status command in DSW environment."""
         from dsw import cmd_status
         
+        mock_run_script.return_value = 0
         mock_args = MagicMock()
         
         # HOSTNAME is set to dsw-123456-abcde in mock_env_credentials
@@ -441,7 +451,7 @@ class TestGetInstancesJson:
     @patch('subprocess.run')
     def test_returns_json(self, mock_run, mock_env_credentials):
         """Test that function returns JSON data."""
-        from dsw import get_instances_json
+        from dsw_commands.helpers import get_instances_json
         
         MOCK_INSTANCES_LIST = [
             {"InstanceId": "dsw-123456-abcde", "InstanceName": "test-instance", "Status": "Running"},
@@ -460,7 +470,7 @@ class TestGetInstancesJson:
     @patch('subprocess.run')
     def test_returns_empty_on_error(self, mock_run, mock_env_credentials):
         """Test that function returns empty list on error."""
-        from dsw import get_instances_json
+        from dsw_commands.helpers import get_instances_json
         
         mock_result = MagicMock()
         mock_result.returncode = 1
@@ -473,7 +483,7 @@ class TestGetInstancesJson:
     @patch('subprocess.run')
     def test_handles_invalid_json(self, mock_run, mock_env_credentials):
         """Test that function handles invalid JSON."""
-        from dsw import get_instances_json
+        from dsw_commands.helpers import get_instances_json
         
         mock_result = MagicMock()
         mock_result.returncode = 0
