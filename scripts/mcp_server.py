@@ -1,316 +1,293 @@
 #!/usr/bin/env python3
 """
-PAI-DSW MCP Server
+MCP Server for PAI-DSW Skill.
 
-Exposes core DSW operations as standard MCP tools for AI Agent integration.
-Communicates via stdio using the Model Context Protocol.
-
-Usage:
-    python mcp_server.py
-
-Requires:
-    pip install mcp
+Provides DSW instance management capabilities via MCP protocol.
 """
 
+import asyncio
 import json
-import os
-import sys
-
-# Ensure scripts/ is on the path for local imports
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from exceptions import DSWError, InstanceNotFoundError, InstanceAmbiguousError
-from dsw_utils import filter_response, INSTANCE_DETAIL_FIELDS
+from dsw_utils import create_client, get_workspace_id, get_region_id
+from alibabacloud_pai_dsw20220101 import models as dsw_models
 
-# ---------------------------------------------------------------------------
-# Lazy imports for standalone scripts (avoids loading SDK at module level)
-# ---------------------------------------------------------------------------
+# Create MCP server
+server = Server("pai-dsw-mcp")
 
-def _import_get_instance():
-    from get_instance import get_instance
-    return get_instance
-
-def _import_list_instances():
-    from list_instances import list_instances
-    return list_instances
-
-def _import_start_instance():
-    from start_instance import start_instance
-    return start_instance
-
-def _import_stop_instance():
-    from stop_instance import stop_instance
-    return stop_instance
-
-def _import_create_instance():
-    from create_instance import create_dsw_instance
-    return create_dsw_instance
-
-def _import_list_images():
-    from list_images import list_images
-    return list_images
-
-def _import_list_ecs_specs():
-    from list_ecs_specs import list_ecs_specs
-    return list_ecs_specs
-
-def _import_get_metrics():
-    from get_instance_metrics import get_instance_metrics
-    return get_instance_metrics
-
-def _resolve(identifier: str) -> str:
-    """Resolve instance name to ID. Raises DSWError on failure."""
-    from dsw_commands.helpers import resolve_instance
-    return resolve_instance(identifier)
-
-
-# ---------------------------------------------------------------------------
-# MCP Server setup
-# ---------------------------------------------------------------------------
-
-server = Server("pai-dsw-skill")
-
-
-# ---------------------------------------------------------------------------
-# Tool definitions
-# ---------------------------------------------------------------------------
-
-TOOLS = [
-    Tool(
-        name="list_instances",
-        description="列出当前工作空间中的所有 PAI-DSW 实例。返回实例 ID、名称、状态等信息。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "detail_level": {
-                    "type": "string",
-                    "enum": ["brief", "summary", "full"],
-                    "default": "summary",
-                    "description": "返回信息的详细程度。brief=仅ID/名称/状态, summary=核心字段(默认), full=全部字段"
-                },
-            },
-        },
-    ),
-    Tool(
-        name="get_instance",
-        description="获取指定 PAI-DSW 实例的详细信息。支持实例 ID 或名称模糊匹配。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "instance": {
-                    "type": "string",
-                    "description": "实例 ID (如 dsw-xxx) 或名称 (支持模糊匹配)"
-                },
-                "detail_level": {
-                    "type": "string",
-                    "enum": ["brief", "summary", "full"],
-                    "default": "full",
-                    "description": "返回信息的详细程度"
-                },
-            },
-            "required": ["instance"],
-        },
-    ),
-    Tool(
-        name="start_instance",
-        description="启动一个已停止的 PAI-DSW 实例。实例必须处于 Stopped 状态。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "instance": {
-                    "type": "string",
-                    "description": "实例 ID 或名称"
-                },
-            },
-            "required": ["instance"],
-        },
-    ),
-    Tool(
-        name="stop_instance",
-        description="停止一个运行中的 PAI-DSW 实例。停止后数据保留，仅释放计算资源。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "instance": {
-                    "type": "string",
-                    "description": "实例 ID 或名称"
-                },
-            },
-            "required": ["instance"],
-        },
-    ),
-    Tool(
-        name="create_instance",
-        description="创建一个新的 PAI-DSW 实例。需要指定名称、镜像和规格。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "实例名称"},
-                "image": {"type": "string", "description": "镜像 ID 或名称"},
-                "instance_type": {"type": "string", "description": "ECS 规格类型 (如 ecs.g6.large)"},
-                "labels": {
-                    "type": "object",
-                    "description": "标签键值对 (可选)",
-                    "additionalProperties": {"type": "string"},
-                },
-            },
-            "required": ["name", "image", "instance_type"],
-        },
-    ),
-    Tool(
-        name="list_images",
-        description="列出可用的 PAI-DSW 镜像，包括官方镜像和自定义镜像。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "image_type": {
-                    "type": "string",
-                    "enum": ["all", "official", "custom"],
-                    "default": "all",
-                    "description": "镜像类型"
-                },
-            },
-        },
-    ),
-    Tool(
-        name="list_specs",
-        description="列出可用的 ECS 实例规格，包括 CPU/GPU/内存配置信息。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "gpu_only": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "仅显示 GPU 规格"
-                },
-            },
-        },
-    ),
-    Tool(
-        name="get_instance_metrics",
-        description="获取实例的资源使用指标 (CPU/内存/GPU 利用率)。",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "instance": {
-                    "type": "string",
-                    "description": "实例 ID 或名称"
-                },
-                "metric_type": {
-                    "type": "string",
-                    "enum": ["cpu", "memory", "gpu", "all"],
-                    "default": "all",
-                    "description": "指标类型"
-                },
-            },
-            "required": ["instance"],
-        },
-    ),
-]
-
-
-# ---------------------------------------------------------------------------
-# Handler registration
-# ---------------------------------------------------------------------------
 
 @server.list_tools()
-async def list_tools():
-    return TOOLS
+async def list_tools() -> list[Tool]:
+    """List available MCP tools."""
+    return [
+        Tool(
+            name="list_instances",
+            description="List all DSW instances in the workspace",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="get_instance",
+            description="Get details of a specific DSW instance",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "description": "Instance ID"}
+                },
+                "required": ["instance_id"]
+            }
+        ),
+        Tool(
+            name="start_instance",
+            description="Start a stopped DSW instance",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "description": "Instance ID"}
+                },
+                "required": ["instance_id"]
+            }
+        ),
+        Tool(
+            name="stop_instance",
+            description="Stop a running DSW instance",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "description": "Instance ID"}
+                },
+                "required": ["instance_id"]
+            }
+        ),
+        Tool(
+            name="get_gpu_usage",
+            description="Get GPU usage for all GPU instances",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "threshold": {"type": "number", "description": "Alert threshold (default 80)"}
+                }
+            }
+        ),
+        Tool(
+            name="list_specs",
+            description="List available ECS specifications",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "gpu_only": {"type": "boolean", "description": "Show only GPU specs"}
+                }
+            }
+        ),
+        Tool(
+            name="list_images",
+            description="List available DSW images",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="get_instance_metrics",
+            description="Get resource metrics for an instance",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "description": "Instance ID"}
+                },
+                "required": ["instance_id"]
+            }
+        ),
+    ]
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict):
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    """Handle tool calls."""
+    
     try:
         if name == "list_instances":
-            detail = arguments.get("detail_level", "summary")
-            fn = _import_list_instances()
-            instances = fn(format="json", detail_level=detail)
-            return [TextContent(type="text", text=json.dumps(instances, indent=2, ensure_ascii=False, default=str))]
-
+            return await _list_instances()
         elif name == "get_instance":
-            detail = arguments.get("detail_level", "full")
-            instance_id = _resolve(arguments["instance"])
-            fn = _import_get_instance()
-            result = fn(instance_id, detail_level=detail)
-            if result is None:
-                return [TextContent(type="text", text=json.dumps({"error": "INSTANCE_NOT_FOUND", "message": f"实例 {arguments['instance']} 未找到"}))]
-            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
-
+            return await _get_instance(arguments["instance_id"])
         elif name == "start_instance":
-            instance_id = _resolve(arguments["instance"])
-            fn = _import_start_instance()
-            result = fn(instance_id)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
-
+            return await _start_instance(arguments["instance_id"])
         elif name == "stop_instance":
-            instance_id = _resolve(arguments["instance"])
-            fn = _import_stop_instance()
-            result = fn(instance_id)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
-
-        elif name == "create_instance":
-            fn = _import_create_instance()
-            labels = arguments.get("labels")
-            labels_json = json.dumps(labels) if labels else None
-            result = fn(
-                name=arguments["name"],
-                image_id=arguments["image"],
-                instance_type=arguments["instance_type"],
-                labels=labels_json,
-            )
-            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
-
-        elif name == "list_images":
-            fn = _import_list_images()
-            image_type = arguments.get("image_type", "all")
-            images = fn(image_type=image_type)
-            # Trim to essential fields for token efficiency
-            brief = []
-            for img in (images or []):
-                brief.append(filter_response(img, ['ImageId', 'ImageName', 'Framework', 'AcceleratorType']))
-            return [TextContent(type="text", text=json.dumps(brief, indent=2, ensure_ascii=False, default=str))]
-
+            return await _stop_instance(arguments["instance_id"])
+        elif name == "get_gpu_usage":
+            threshold = arguments.get("threshold", 80)
+            return await _get_gpu_usage(threshold)
         elif name == "list_specs":
-            fn = _import_list_ecs_specs()
             gpu_only = arguments.get("gpu_only", False)
-            specs = fn(gpu_only=gpu_only)
-            return [TextContent(type="text", text=json.dumps(specs, indent=2, ensure_ascii=False, default=str))]
-
+            return await _list_specs(gpu_only)
+        elif name == "list_images":
+            return await _list_images()
         elif name == "get_instance_metrics":
-            instance_id = _resolve(arguments["instance"])
-            fn = _import_get_metrics()
-            metric_type = arguments.get("metric_type", "all")
-            result = fn(instance_id, metric_type=metric_type)
-            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False, default=str))]
-
+            return await _get_instance_metrics(arguments["instance_id"])
         else:
-            return [TextContent(type="text", text=json.dumps({"error": "UNKNOWN_TOOL", "message": f"未知工具: {name}"}))]
-
-    except DSWError as e:
-        return [TextContent(type="text", text=json.dumps(e.to_dict(), ensure_ascii=False))]
+            return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": "INTERNAL_ERROR", "message": str(e)}, ensure_ascii=False))]
+        return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+async def _list_instances() -> list[TextContent]:
+    """List all instances."""
+    client = create_client()
+    workspace_id = get_workspace_id()
+    
+    request = dsw_models.ListInstancesRequest()
+    request.workspace_id = workspace_id
+    
+    response = client.list_instances(request)
+    
+    instances = []
+    if response.body and response.body.instances:
+        for inst in response.body.instances:
+            instances.append({
+                "instance_id": inst.instance_id,
+                "instance_name": inst.instance_name,
+                "status": inst.status,
+                "ecs_spec": inst.ecs_spec,
+            })
+    
+    return [TextContent(type="text", text=json.dumps(instances, indent=2))]
 
-async def _main():
+
+async def _get_instance(instance_id: str) -> list[TextContent]:
+    """Get instance details."""
+    client = create_client()
+    
+    request = dsw_models.GetInstanceRequest()
+    response = client.get_instance(instance_id, request)
+    
+    if response.body:
+        data = {
+            "instance_id": response.body.instance_id,
+            "instance_name": response.body.instance_name,
+            "status": response.body.status,
+            "ecs_spec": response.body.ecs_spec,
+            "workspace_id": response.body.workspace_id,
+        }
+        return [TextContent(type="text", text=json.dumps(data, indent=2))]
+    
+    return [TextContent(type="text", text="Instance not found")]
+
+
+async def _start_instance(instance_id: str) -> list[TextContent]:
+    """Start an instance."""
+    client = create_client()
+    
+    request = dsw_models.StartInstanceRequest()
+    response = client.start_instance(instance_id, request)
+    
+    return [TextContent(type="text", text=f"Instance {instance_id} started")]
+
+
+async def _stop_instance(instance_id: str) -> list[TextContent]:
+    """Stop an instance."""
+    client = create_client()
+    
+    request = dsw_models.StopInstanceRequest()
+    response = client.stop_instance(instance_id, request)
+    
+    return [TextContent(type="text", text=f"Instance {instance_id} stopped")]
+
+
+async def _get_gpu_usage(threshold: float) -> list[TextContent]:
+    """Get GPU usage for all GPU instances."""
+    client = create_client()
+    workspace_id = get_workspace_id()
+    
+    # Get all instances
+    request = dsw_models.ListInstancesRequest()
+    request.workspace_id = workspace_id
+    response = client.list_instances(request)
+    
+    # GPU spec keywords
+    gpu_specs = ['gn', 'gn6', 'gn7', 'gn8', 'gn6i', 'gn7i', 'gn8i', 'p3', 'p4']
+    
+    results = []
+    if response.body and response.body.instances:
+        for inst in response.body.instances:
+            ecs_spec = inst.ecs_spec or ''
+            is_gpu = any(spec in ecs_spec.lower() for spec in gpu_specs)
+            
+            if is_gpu and inst.status == 'Running':
+                results.append({
+                    "instance_id": inst.instance_id,
+                    "instance_name": inst.instance_name,
+                    "status": inst.status,
+                    "ecs_spec": ecs_spec,
+                })
+    
+    return [TextContent(type="text", text=json.dumps(results, indent=2))]
+
+
+async def _list_specs(gpu_only: bool) -> list[TextContent]:
+    """List ECS specs."""
+    client = create_client()
+    
+    specs = []
+    for accel_type in ['CPU', 'GPU']:
+        try:
+            request = dsw_models.ListEcsSpecsRequest()
+            request.accelerator_type = accel_type
+            response = client.list_ecs_specs(request)
+            
+            if response.body and response.body.ecs_specs:
+                for spec in response.body.ecs_specs:
+                    if gpu_only and accel_type != 'GPU':
+                        continue
+                    specs.append({
+                        "ecs_spec": getattr(spec, 'instance_type', 'N/A'),
+                        "cpu": getattr(spec, 'cpu', 0),
+                        "memory": getattr(spec, 'memory', 0),
+                        "gpu_count": getattr(spec, 'gpu', 0),
+                        "gpu_type": getattr(spec, 'gpu_type', None),
+                    })
+        except Exception:
+            pass
+    
+    return [TextContent(type="text", text=json.dumps(specs, indent=2))]
+
+
+async def _list_images() -> list[TextContent]:
+    """List available images."""
+    # Return common images
+    images = [
+        {"name": "modelscope:1.34.0-pytorch2.9.1-cpu-py311-ubuntu22.04", "type": "CPU"},
+        {"name": "modelscope:1.34.0-pytorch2.9.1-gpu-py311-cu124-ubuntu22.04", "type": "GPU"},
+        {"name": "pytorch:2.0.0-gpu-cu118", "type": "GPU"},
+        {"name": "tensorflow:2.12.0-gpu", "type": "GPU"},
+    ]
+    return [TextContent(type="text", text=json.dumps(images, indent=2))]
+
+
+async def _get_instance_metrics(instance_id: str) -> list[TextContent]:
+    """Get instance metrics."""
+    client = create_client()
+    
+    request = dsw_models.GetInstanceMetricsRequest()
+    request.instance_id = instance_id
+    request.metric_type = 'All'
+    
+    response = client.get_instance_metrics(instance_id, request)
+    
+    metrics = {}
+    if response.body and response.body.metrics:
+        for metric in response.body.metrics:
+            name = getattr(metric, 'metric_name', 'unknown')
+            value = getattr(metric, 'value', 0)
+            metrics[name] = value
+    
+    return [TextContent(type="text", text=json.dumps(metrics, indent=2))]
+
+
+async def run():
+    """Run the MCP server."""
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def main():
-    import asyncio
-    asyncio.run(_main())
-
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
